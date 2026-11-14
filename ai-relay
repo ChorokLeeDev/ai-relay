@@ -290,6 +290,126 @@ def feedback(text):
             "additionalContext": text + "\n\n" + COMMENT_GUIDANCE}}
 
 
+def status_type(thread):
+    status = thread.get("status", {})
+    return status.get("type", "unknown") if isinstance(status, dict) else status
+
+
+def checkout(path):
+    path = Path(path).resolve()
+    result = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                            capture_output=True, text=True, timeout=5)
+    return Path(result.stdout.strip()).resolve() if result.returncode == 0 else path
+
+
+def discover_claude():
+    result = subprocess.run(["claude", "agents", "--json"],
+                            capture_output=True, text=True, timeout=15)
+    if result.returncode != 0:
+        raise RuntimeError("Claude session discovery failed. Check claude agents --json.")
+    sessions = []
+    for agent in json.loads(result.stdout):
+        if agent.get("kind") != "interactive" or not agent.get("sessionId"):
+            continue
+        try:
+            os.kill(int(agent["pid"]), 0)
+        except (ProcessLookupError, KeyError, ValueError):
+            continue
+        except PermissionError:
+            pass
+        sessions.append({"agent": "Claude", "id": agent["sessionId"],
+                         "cwd": agent.get("cwd"), "status": agent.get("status", "unknown"),
+                         "name": agent.get("name", ""), "ready": True})
+    return sessions
+
+
+def discover_codex():
+    client = CodexClient(timeout=15)
+    try:
+        client.initialize()
+        sessions = []
+        for thread_id in client.call("thread/loaded/list", {}).get("data", []):
+            try:
+                thread = client.thread(thread_id)
+            except RuntimeError:
+                continue  # A terminal may close during discovery.
+            status = status_type(thread)
+            if status not in ("active", "idle") or thread.get("canAcceptDirectInput") is False:
+                continue
+            preview = thread.get("preview", "")
+            name = thread.get("name") or preview
+            sessions.append({"agent": "Codex", "id": thread["id"],
+                             "cwd": thread.get("cwd"), "status": status,
+                             "name": name.splitlines()[0][:80] if name else "",
+                             "ready": bool(preview.strip())})
+        return sessions
+    finally:
+        client.close()
+
+
+def discover_sessions(kinds=("Claude", "Codex")):
+    sessions, problems = [], []
+    for kind, discover in (("Claude", discover_claude), ("Codex", discover_codex)):
+        if kind not in kinds:
+            continue
+        try:
+            sessions.extend(discover())
+        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+            problems.append(f"{kind}: {exc}")
+    return sessions, problems
+
+
+def session_label(session):
+    note = "" if session["ready"] else "; send one prompt in this Codex terminal first"
+    return (f"{session['agent']} {session['id']} [{session['status']}{note}]\n"
+            f"    {session.get('cwd') or '(unknown directory)'}  {session.get('name', '')}")
+
+
+def choose_session(kind, sessions, repo):
+    candidates = [s for s in sessions if s["agent"] == kind and s["ready"] and s.get("cwd")]
+    matching = [s for s in candidates if checkout(s["cwd"]) == checkout(repo)]
+    if len(matching) == 1:
+        return matching[0]["id"]
+    choices = matching or candidates
+    if not choices:
+        raise ValueError(f"No ready {kind} session found. Open {kind} in {repo}. "
+                         + ("Send one prompt in Codex first. " if kind == "Codex" else "")
+                         + "Then run ai-relay link again; ai-relay sessions lists detected sessions.")
+    if not sys.stdin.isatty():
+        listing = "\n".join(session_label(s) for s in choices)
+        raise ValueError(f"Cannot automatically choose {kind} for {repo}.\n{listing}\n"
+                         f"Run ai-relay link interactively, or pass --{kind.lower()} SESSION_UUID.")
+    print(f"Choose {kind} session" + (" (none in the selected checkout)" if not matching else "") + ":")
+    for index, session in enumerate(choices, 1):
+        print(f"  {index}. {session_label(session)}")
+    while True:
+        try:
+            answer = input(f"{kind} [1-{len(choices)}, q to cancel]: ").strip()
+        except EOFError:
+            raise ValueError("Connection cancelled.") from None
+        if answer.lower() in ("q", "quit"):
+            raise ValueError("Connection cancelled.")
+        if answer.isdecimal() and 1 <= int(answer) <= len(choices):
+            return choices[int(answer) - 1]["id"]
+        print("Enter a listed number, or q to cancel.")
+
+
+def resumable_thread(client, thread_id):
+    try:
+        client.call("thread/resume", {"threadId": thread_id})
+    except RuntimeError as exc:
+        if "no rollout" in str(exc).lower():
+            raise ValueError("This Codex session has no saved conversation. Open the Codex terminal "
+                             "and send one prompt, then run ai-relay link again.") from None
+        raise
+    thread = client.thread(thread_id)
+    if thread.get("canAcceptDirectInput") is False:
+        raise ValueError("This Codex thread cannot receive direct input. Choose a session from ai-relay sessions.")
+    if status_type(thread) not in ("active", "idle"):
+        raise ValueError(f"Codex session is {status_type(thread)}; open it before linking.")
+    return thread
+
+
 def saved_feedback(session, config):
     path = state_path(session)
     initial = read_json(path, {})
@@ -457,6 +577,21 @@ def hook(event):
 
 
 def install(args):
+    if args.repo:
+        args.repo = str(Path(args.repo).resolve())
+    else:
+        args.repo = str(checkout(Path.cwd()))
+        if not (Path(args.repo) / ".git").exists():
+            raise ValueError("Run ai-relay link from a Git checkout, or pass --repo /path/to/checkout.")
+    if not Path(args.repo).is_dir():
+        raise ValueError("The checkout directory does not exist: " + args.repo)
+    missing = [kind for kind in ("Claude", "Codex") if not getattr(args, kind.lower())]
+    if missing:
+        sessions, problems = discover_sessions(missing)
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        for kind in missing:
+            setattr(args, kind.lower(), choose_session(kind, sessions, args.repo))
     claude = str(uuid.UUID(args.claude))
     codex = str(uuid.UUID(args.codex))
     if not 1 <= args.rounds <= 8:
@@ -466,7 +601,7 @@ def install(args):
     client = CodexClient()
     try:
         client.initialize()
-        thread = client.thread(codex)
+        thread = resumable_thread(client, codex)
     finally:
         client.close()
     settings = Path.home() / ".claude/settings.json"
@@ -498,6 +633,9 @@ def install(args):
                         "codex_cwd": thread.get("cwd")})
     write_json(state_path(claude), {"epoch": uuid.uuid4().hex, "round": 0, "prompt": "", "done": False})
     print(f"Linked Claude {claude} -> Codex {codex} -> Claude.")
+    print(f"Checkout: {args.repo}")
+    if status_type(thread) == "active":
+        print("Codex is working; the relay will wait for its current task to finish.")
     print(f"Starts after the next Claude reply. Maximum {args.rounds} exchanges per human prompt.")
     print("Status: ai-relay status\nDisable: ai-relay off")
 
@@ -594,14 +732,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     link = sub.add_parser("link", help="Connect existing sessions; does not send a model request")
-    link.add_argument("--claude", required=True, help="Claude session UUID")
-    link.add_argument("--codex", required=True, help="Existing Codex thread UUID")
-    link.add_argument("--repo", required=True, help="Actual checkout to review")
+    link.add_argument("--claude", help="Claude session UUID (default: detect running sessions)")
+    link.add_argument("--codex", help="Codex thread UUID (default: detect loaded sessions)")
+    link.add_argument("--repo", help="Checkout to review (default: current Git checkout)")
     link.add_argument("--rounds", type=int, default=3)
     link.add_argument("--timeout", type=int, default=600)
     link.add_argument("--wait-timeout", type=int, default=1800, help="Seconds to wait for an existing Codex task")
     retry_parser = sub.add_parser("retry", help="Retry the saved reply after a failed automatic review")
     retry_parser.add_argument("--request", help="Explicit saved exchange ID, including after a newer Claude prompt")
+    sessions_parser = sub.add_parser("sessions", help="Detect running Claude and loaded Codex sessions")
+    sessions_parser.add_argument("--json", action="store_true", help="Print session data as JSON")
     sub.add_parser("status", help="Show the connected sessions and recent exchanges")
     sub.add_parser("off", help="Stop forwarding; existing terminal sessions keep running")
     doctor = sub.add_parser("doctor", help="Check the daemon connection without sending a prompt")
@@ -609,6 +749,18 @@ def main():
     args = parser.parse_args()
     if args.command == "link":
         install(args)
+    elif args.command == "sessions":
+        sessions, problems = discover_sessions()
+        if args.json:
+            print(json.dumps({"sessions": sessions, "problems": problems}, ensure_ascii=False, indent=2))
+        else:
+            for session in sessions:
+                print(session_label(session))
+            for problem in problems:
+                print(problem, file=sys.stderr)
+            if not sessions:
+                print("No sessions detected. Open Claude and Codex, then run ai-relay sessions again.")
+            print("Connect from your checkout: ai-relay link")
     elif args.command == "retry":
         retry(args.request)
     elif args.command == "status":
@@ -633,9 +785,10 @@ def main():
         client = CodexClient()
         try:
             client.initialize()
-            thread = client.thread(thread_id)
+            thread = resumable_thread(client, thread_id)
             print(json.dumps({"connected": True, "thread": thread["id"],
-                              "cwd": thread.get("cwd"), "status": thread.get("status")}, indent=2))
+                              "resumable": True, "cwd": thread.get("cwd"),
+                              "status": thread.get("status")}, indent=2))
         finally:
             client.close()
 
@@ -643,6 +796,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
+    except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
         print(f"ai-relay: {exc}", file=sys.stderr)
         sys.exit(1)

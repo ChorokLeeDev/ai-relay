@@ -41,9 +41,20 @@ cd /path/to/repository
 codex
 ~~~
 
-Find the new Claude session's `sessionId` by running `claude agents --json` in another shell. In the Codex terminal, open `/statusline` and enable **Session ID**.
+Send one prompt in the Codex terminal, such as `Ready to review.` A brand-new Codex session needs a saved conversation before the daemon can resume it.
 
-Link the two IDs from a shell:
+From another shell in the same repository:
+
+~~~bash
+ai-relay sessions
+ai-relay link
+~~~
+
+`sessions` detects running interactive Claude processes and Codex sessions loaded in the local daemon. It shows their IDs, directories, status, and names. Blank Codex sessions are listed with instructions to send a prompt first. Discovery sends no model requests.
+
+`link` automatically selects a ready session for each agent in the current checkout, including subdirectories. If several match, it asks you to select from a numbered list. It never guesses between multiple sessions. When none match, an interactive shell lets you choose from sessions in other directories. Scripts must provide IDs for ambiguous selections.
+
+For a separate review checkout, use `ai-relay link --repo /path/to/checkout`. You can still specify either or both session IDs:
 
 ~~~bash
 ai-relay link \
@@ -53,7 +64,7 @@ ai-relay link \
   --rounds 3
 ~~~
 
-Then give Claude the task. The relay sends its completed answer to Codex, waits for that specific review turn to complete, and returns the final review to Claude. It forwards completed answers rather than terminal scrollback or intermediate progress.
+The connection is checked for resumability before settings are changed. Then give Claude the task. The relay sends its completed answer to Codex, waits for that specific review turn to complete, and returns the final review to Claude. It forwards completed answers rather than terminal scrollback or intermediate progress.
 
 `link` registers session-specific handlers in your Claude settings, preserving existing hooks and saving a backup. It connects one pair at a time. A new task in the same pair only needs a new Claude prompt; fresh sessions require linking their new IDs.
 
@@ -61,8 +72,11 @@ Then give Claude the task. The relay sends its completed answer to Codex, waits 
 
 | Command | Behavior |
 | --- | --- |
+| `ai-relay sessions` | Detect Claude processes and loaded Codex sessions. |
+| `ai-relay sessions --json` | Return detected sessions and discovery problems for scripts. |
+| `ai-relay link` | Detect and connect sessions for the current checkout. |
 | `ai-relay status` | Show the linked sessions and recent exchanges. |
-| `ai-relay doctor` | Check the daemon connection without sending a model request. |
+| `ai-relay doctor` | Check daemon connectivity and session resumability without sending a model request. |
 | `ai-relay off` | Disable forwarding and cancel any pending relay-owned review. |
 | `ai-relay retry` | Retry the saved reply after a failed review. |
 | `ai-relay retry --request EXCHANGE_ID` | Explicitly retry a saved exchange, including after a newer Claude prompt. |
@@ -79,8 +93,9 @@ Settings, backups, prompts, replies, and logs are stored locally in `~/.local/sh
 
 ~~~bash
 python3 tests/verify_relay.py
+python3 tests/verify_discovery.py
 ~~~
 
-The checks use a mock Unix WebSocket server, synthetic session IDs, and a temporary home directory. They verify message framing, completed-turn correlation, long and fragmented replies, busy-to-idle waiting, round limits, approval handling, saved feedback delivery, and preservation of existing settings. They send no model requests and do not alter your live configuration.
+The checks use a mock Unix WebSocket server, synthetic session IDs, and a temporary home directory. They verify message framing, completed-turn correlation, long and fragmented replies, busy-to-idle waiting, round limits, approval handling, saved feedback delivery, and preservation of existing settings. Discovery checks cover closed Claude processes, blank Codex threads, checkout matching, ambiguous selections, and failed connections leaving settings untouched. They send no model requests and do not alter your live configuration.
 
 Protocol references: [Codex App Server](https://developers.openai.com/codex/app-server/), [Codex slash commands](https://developers.openai.com/codex/cli/slash-commands/), and [Claude Code hooks](https://code.claude.com/docs/en/hooks).
