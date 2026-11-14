@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Relay completed Claude Code replies to an existing Codex thread and back."""
+"""Connect existing Claude Code and Codex terminals and relay their completed replies."""
 import argparse
 import base64
 from collections import deque
@@ -313,7 +313,12 @@ class CodexClient:
             status = thread.get("status", {})
             status = status.get("type") if isinstance(status, dict) else status
             if status in (None, "idle", "notLoaded"):
-                self.call("thread/resume", {"threadId": thread_id})
+                try:
+                    self.call("thread/resume", {"threadId": thread_id})
+                except RuntimeError as exc:
+                    if "no rollout" not in str(exc).lower() or status != "idle":
+                        raise
+                    # Fresh, loaded terminals accept turn/start without a saved rollout.
                 # Resuming subscribes this connection. Recheck before sending a new turn.
                 status = self.thread(thread_id).get("status", {})
                 status = status.get("type") if isinstance(status, dict) else status
@@ -338,7 +343,29 @@ class CodexClient:
             on_start(turn_id)
         final_messages = {}
         last_message = ""
+        next_poll = time.monotonic() + 1
         while True:
+            if not self.notifications and not self.messages:
+                self.parse_frames()
+                if not self.messages and not self.selector.select(0.2):
+                    if self.keep_running and not self.keep_running():
+                        raise RuntimeError("Relay disabled or a newer prompt superseded this exchange.")
+                    if time.monotonic() >= self.deadline:
+                        raise TimeoutError("Codex relay timed out. See ai-relay status.")
+                    if time.monotonic() >= next_poll:
+                        turns = self.call("thread/read", {"threadId": thread_id, "includeTurns": True})["thread"].get("turns", [])
+                        completed = next((t for t in turns if t["id"] == turn_id and t.get("status") in
+                                          ("completed", "failed", "interrupted")), None)
+                        if completed:
+                            self.finished = True
+                            if completed["status"] != "completed":
+                                raise RuntimeError(f"Codex turn {completed['status']}: {completed.get('error')}")
+                            reply = turn_reply(completed)
+                            if not reply.strip():
+                                raise RuntimeError("Codex finished without an assistant reply.")
+                            return reply, turn_id
+                        next_poll = time.monotonic() + 1
+                    continue
             message = self.notifications.popleft() if self.notifications else self.receive()
             if "id" in message and "method" in message:
                 raise RuntimeError("Codex needs human approval or input: " + message["method"])
@@ -450,7 +477,7 @@ def discover_codex():
             sessions.append({"agent": "Codex", "id": thread["id"],
                              "cwd": thread.get("cwd"), "status": status,
                              "name": name.splitlines()[0][:80] if name else "",
-                             "ready": bool(preview.strip())})
+                             "ready": True, "fresh": not bool(preview.strip())})
         return sessions
     finally:
         client.close()
@@ -469,7 +496,7 @@ def discover_sessions(kinds=("Claude", "Codex")):
 
 
 def session_label(session):
-    note = "" if session["ready"] else "; send one prompt in this Codex terminal first"
+    note = "; fresh terminal" if session.get("fresh") else ""
     return (f"{session['agent']} {session['id']} [{session['status']}{note}]\n"
             f"    {session.get('cwd') or '(unknown directory)'}  {session.get('name', '')}")
 
@@ -481,9 +508,8 @@ def choose_session(kind, sessions, repo):
         return matching[0]["id"]
     choices = matching or candidates
     if not choices:
-        raise ValueError(f"No ready {kind} session found. Open {kind} in {repo}. "
-                         + ("Send one prompt in Codex first. " if kind == "Codex" else "")
-                         + "Then run ai-relay link again; ai-relay sessions lists detected sessions.")
+        raise ValueError(f"No running {kind} session found. Open {kind} in {repo}. "
+                         "Then run ai-relay link again; ai-relay sessions lists detected sessions.")
     if not sys.stdin.isatty():
         listing = "\n".join(session_label(s) for s in choices)
         raise ValueError(f"Cannot automatically choose {kind} for {repo}.\n{listing}\n"
@@ -503,20 +529,61 @@ def choose_session(kind, sessions, repo):
         print("Enter a listed number, or q to cancel.")
 
 
-def resumable_thread(client, thread_id):
-    try:
-        client.call("thread/resume", {"threadId": thread_id})
-    except RuntimeError as exc:
-        if "no rollout" in str(exc).lower():
-            raise ValueError("This Codex session has no saved conversation. Open the Codex terminal "
-                             "and send one prompt, then run ai-relay link again.") from None
-        raise
+def choose_pair(sessions, repo=None, exclude=(), previous=None):
+    """Find a pair sharing a workspace, including when invoked from another directory."""
+    excluded = set(exclude)
+    if os.environ.get("CODEX_THREAD_ID"):
+        excluded.add(os.environ["CODEX_THREAD_ID"])
+    candidates = [s for s in sessions if s.get("ready") and s.get("cwd") and s["id"] not in excluded]
+    workspaces = {}
+    for session in candidates:
+        workspace = checkout(session["cwd"])
+        if repo is None or workspace == checkout(repo):
+            workspaces.setdefault(workspace, {"Claude": [], "Codex": []})[session["agent"]].append(session)
+    pairs = [(str(workspace), c, x) for workspace, agents in workspaces.items()
+             for c in agents["Claude"] for x in agents["Codex"]]
+    previous = previous or {}
+    fresh_pairs = [p for p in pairs if p[1]["id"] != previous.get("claude")
+                   and p[2]["id"] != previous.get("codex")]
+    choices = fresh_pairs or pairs
+    if len(choices) == 1:
+        workspace, claude, codex = choices[0]
+        return workspace, claude["id"], codex["id"]
+    if not choices:
+        raise ValueError("No Claude/Codex pair found in the same workspace. Open both terminals in "
+                         "the task directory; no initial message is needed.")
+    if not sys.stdin.isatty():
+        listing = "\n".join(f"{workspace}\n{session_label(c)}\n{session_label(x)}"
+                            for workspace, c, x in choices)
+        raise ValueError("Multiple terminal pairs found. Choose --repo or --claude/--codex.\n" + listing)
+    print("Choose the terminal pair:")
+    for index, (workspace, c, x) in enumerate(choices, 1):
+        print(f"  {index}. {workspace}\n    Claude {c['id']} | Codex {x['id']}")
+    while True:
+        try:
+            answer = input(f"Pair [1-{len(choices)}, q to cancel]: ").strip()
+        except EOFError:
+            raise ValueError("Connection cancelled.") from None
+        if answer.lower() in ("q", "quit"):
+            raise ValueError("Connection cancelled.")
+        if answer.isdecimal() and 1 <= int(answer) <= len(choices):
+            workspace, c, x = choices[int(answer) - 1]
+            return workspace, c["id"], x["id"]
+
+
+def resumable_thread(client, thread_id, allow_fresh=False):
     thread = client.thread(thread_id)
     if thread.get("canAcceptDirectInput") is False:
         raise ValueError("This Codex thread cannot receive direct input. Choose a session from ai-relay sessions.")
     if status_type(thread) not in ("active", "idle"):
         raise ValueError(f"Codex session is {status_type(thread)}; open it before linking.")
-    return thread
+    try:
+        client.call("thread/resume", {"threadId": thread_id})
+    except RuntimeError as exc:
+        if allow_fresh and "no rollout" in str(exc).lower():
+            return {**thread, "relay_fresh": True}
+        raise
+    return client.thread(thread_id)
 
 
 ITERM_SCRIPT = '''
@@ -535,7 +602,8 @@ on run argv
                             return screenText
                         end if
                         set messageText to read (POSIX file (item 3 of argv)) as «class utf8»
-                        tell s to write text messageText newline false
+                        tell s to write text ((ASCII character 27) & "[200~" & messageText & (ASCII character 27) & "[201~") newline false
+                        delay 0.2
                         tell s to write text (ASCII character 13) newline false
                         return "sent"
                     end if
@@ -981,6 +1049,58 @@ def start_worker(config):
     print(f"Role announcements queued (PID {process.pid}); log: {ROOT / 'startup.log'}")
 
 
+def queue_task(config, prompt, start=True):
+    task_id = uuid.uuid4().hex
+    write_json(ROOT / "tasks" / (task_id + ".json"),
+               {"link_id": config["link_id"], "prompt": prompt,
+                "epoch": read_json(state_path(config["claude"]), {}).get("epoch")})
+    if start:
+        with (ROOT / "tasks.log").open("a") as log:
+            process = subprocess.Popen(["nohup", sys.executable, SCRIPT, "_task", task_id],
+                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        print(f"Task queued for the {config.get('initiator', 'claude').title()} terminal (PID {process.pid}).")
+    return task_id
+
+
+def task_worker(task_id):
+    task = read_json(ROOT / "tasks" / (task_id + ".json"), {})
+    config = read_json(CONFIG, {})
+    started = False
+
+    def current():
+        return (config.get("link_id") == task.get("link_id") and link_current(config)
+                and (started or read_json(state_path(config["claude"]), {}).get("epoch") == task.get("epoch")))
+
+    def on_start(turn_id):
+        nonlocal started
+        started = True
+        record("task_sent", link=config["link_id"], task=task_id, initiator="codex", turn=turn_id)
+
+    if not current():
+        return
+    try:
+        prompt = task["prompt"]
+        if config.get("initiator", "claude") == "claude":
+            send_claude(config, prompt, current)
+        else:
+            client = CodexClient(config["timeout"], current)
+            try:
+                client.initialize()
+                with codex_lock(config["codex"], config.get("wait_timeout", 1800), current):
+                    client.deadline = time.monotonic() + config["timeout"]
+                    reply, turn_id = client.review(config["codex"], prompt,
+                                                  wait_timeout=config.get("wait_timeout", 1800), on_start=on_start)
+                save_decision(config, reply)
+            finally:
+                client.close()
+        if not started:
+            record("task_sent", link=config["link_id"], task=task_id, initiator=config.get("initiator", "claude"))
+        print("Task delivered in the participating terminal.", flush=True)
+    except Exception as exc:
+        record("task_error", link=config["link_id"], task=task_id, error=str(exc))
+        print("Task delivery incomplete: " + str(exc), flush=True)
+
+
 def startup_worker(link_id):
     config = read_json(CONFIG, {})
     if config.get("link_id") != link_id or not link_current(config):
@@ -1004,6 +1124,8 @@ def startup_worker(link_id):
                 + "\nAcknowledge your role briefly. Do not start a task or treat this setup as a review.",
                 wait_timeout=config.get("wait_timeout", 1800))
         record("codex_notified", link=link_id)
+        if config.get("task_id"):
+            task_worker(config["task_id"])
         if config.get("initiator", "claude") == "codex":
             watch_codex(client, config, seen)
     except Exception as exc:
@@ -1014,12 +1136,27 @@ def startup_worker(link_id):
 
 
 def install(args):
+    prompt = Path(args.task_file).read_text() if getattr(args, "task_file", None) else None
+    if prompt is not None and (not prompt.strip() or prompt.startswith("[AI_RELAY")):
+        raise ValueError("Provide a nonempty human task, not a relay control message.")
+    auto_workspace = getattr(args, "command", "link") == "here"
+    exclude = set(getattr(args, "exclude", []) or [])
+    if os.environ.get("CODEX_THREAD_ID"):
+        exclude.add(os.environ["CODEX_THREAD_ID"])
+    if auto_workspace:
+        sessions, problems = discover_sessions()
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        sessions = [s for s in sessions if s["id"] not in exclude]
+        if args.claude or args.codex:
+            sessions = [s for s in sessions if
+                        (s["agent"] != "Claude" or not args.claude or s["id"] == args.claude) and
+                        (s["agent"] != "Codex" or not args.codex or s["id"] == args.codex)]
+        args.repo, args.claude, args.codex = choose_pair(sessions, args.repo, exclude, read_json(CONFIG, {}))
     if args.repo:
         args.repo = str(Path(args.repo).resolve())
     else:
         args.repo = str(checkout(Path.cwd()))
-        if not (Path(args.repo) / ".git").exists():
-            raise ValueError("Run ai-relay link from a Git checkout, or pass --repo /path/to/checkout.")
     if not Path(args.repo).is_dir():
         raise ValueError("The checkout directory does not exist: " + args.repo)
     missing = [kind for kind in ("Claude", "Codex") if not getattr(args, kind.lower())]
@@ -1027,10 +1164,13 @@ def install(args):
         sessions, problems = discover_sessions(missing)
         for problem in problems:
             print(problem, file=sys.stderr)
+        sessions = [s for s in sessions if s["id"] not in exclude]
         for kind in missing:
             setattr(args, kind.lower(), choose_session(kind, sessions, args.repo))
     claude = str(uuid.UUID(args.claude))
     codex = str(uuid.UUID(args.codex))
+    if codex in exclude:
+        raise ValueError("The calling Codex session cannot relay to itself. Choose another terminal.")
     initiator = choose_initiator(getattr(args, "initiator", None))
     try:
         claude_terminal = terminal_for_claude(claude)
@@ -1045,9 +1185,20 @@ def install(args):
     client = CodexClient()
     try:
         client.initialize()
-        thread = resumable_thread(client, codex)
+        thread = resumable_thread(client, codex, allow_fresh=True)
     finally:
         client.close()
+    if prompt is not None and initiator == "claude" and not claude_terminal:
+        raise ValueError("Task delivery requires the Claude terminal in iTerm2 or tmux.")
+    previous = read_json(CONFIG, {})
+    if (auto_workspace and link_current(previous) and previous.get("claude") == claude
+            and previous.get("codex") == codex and previous.get("repo") == args.repo
+            and previous.get("initiator", "claude") == initiator
+            and previous.get("claude_terminal") == claude_terminal):
+        print(f"Already connected: Claude {claude} | Codex {codex}\nWorkspace: {args.repo}")
+        if prompt is not None:
+            queue_task(previous, prompt)
+        return
     settings = Path.home() / ".claude/settings.json"
     data = read_json(settings, {})
     hooks = data.setdefault("hooks", {})
@@ -1078,12 +1229,18 @@ def install(args):
                         "codex_cwd": thread.get("cwd")}
     write_json(CONFIG, config)
     write_json(state_path(claude), {"epoch": uuid.uuid4().hex, "round": 0, "prompt": "", "done": False})
+    if prompt is not None:
+        config["task_id"] = queue_task(config, prompt, start=False)
+        write_json(CONFIG, config)
     print(f"Linked Claude {claude} -> Codex {codex} -> Claude.")
     print(f"Checkout: {args.repo}")
     print(f"Initiator: {initiator.title()} | Reviewer: {'Codex' if initiator == 'claude' else 'Claude'}")
     if status_type(thread) == "active":
         print("Codex is working; the relay will wait for its current task to finish.")
-    print(f"Starts after the next {initiator.title()} reply. Maximum {args.rounds} exchanges per human prompt.")
+    if prompt is not None:
+        print(f"Task queued for the {initiator.title()} terminal after role announcements.")
+    else:
+        print(f"Give the task to {initiator.title()}. Maximum {args.rounds} exchanges per human prompt.")
     print("Status: ai-relay status\nDisable: ai-relay off")
     start_worker(config)
 
@@ -1168,6 +1325,9 @@ def retry_worker(source, epoch):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "_task":
+        task_worker(sys.argv[2])
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "_start":
         startup_worker(sys.argv[2])
         return
@@ -1184,15 +1344,19 @@ def main():
         return
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    link = sub.add_parser("link", help="Choose roles, connect sessions, and announce the relay")
-    link.add_argument("--initiator", choices=("claude", "codex"),
-                      help="Who leads (default: ask interactively; Claude in scripts)")
-    link.add_argument("--claude", help="Claude session UUID (default: detect running sessions)")
-    link.add_argument("--codex", help="Codex thread UUID (default: detect loaded sessions)")
-    link.add_argument("--repo", help="Checkout to review (default: current Git checkout)")
-    link.add_argument("--rounds", type=int, default=3)
-    link.add_argument("--timeout", type=int, default=600)
-    link.add_argument("--wait-timeout", type=int, default=1800, help="Seconds to wait for an existing Codex task")
+    for name, description in (("link", "Connect sessions in the current workspace"),
+                              ("here", "Detect a new terminal pair and deliver a task from any directory")):
+        link = sub.add_parser(name, help=description)
+        link.add_argument("--initiator", choices=("claude", "codex"),
+                          help="Who leads (default: ask interactively; Claude in scripts)")
+        link.add_argument("--claude", help="Claude session UUID (default: detect running sessions)")
+        link.add_argument("--codex", help="Codex thread UUID (default: detect loaded sessions)")
+        link.add_argument("--repo", help="Workspace (default: current directory for link; detected pair for here)")
+        link.add_argument("--exclude", action="append", default=[], help="Exclude a session UUID from discovery")
+        link.add_argument("--task-file", help="UTF-8 file containing the task to send to the initiator terminal")
+        link.add_argument("--rounds", type=int, default=3)
+        link.add_argument("--timeout", type=int, default=600)
+        link.add_argument("--wait-timeout", type=int, default=1800, help="Seconds to wait for an existing Codex task")
     retry_parser = sub.add_parser("retry", help="Retry the saved reply after a failed automatic review")
     retry_parser.add_argument("--request", help="Explicit saved exchange ID, including after a newer Claude prompt")
     sessions_parser = sub.add_parser("sessions", help="Detect running Claude and loaded Codex sessions")
@@ -1203,7 +1367,7 @@ def main():
     doctor = sub.add_parser("doctor", help="Check the daemon connection without sending a prompt")
     doctor.add_argument("--codex", help="Thread UUID (defaults to the connected thread)")
     args = parser.parse_args()
-    if args.command == "link":
+    if args.command in ("link", "here"):
         install(args)
     elif args.command == "sessions":
         sessions, problems = discover_sessions()
@@ -1245,9 +1409,10 @@ def main():
         client = CodexClient()
         try:
             client.initialize()
-            thread = resumable_thread(client, thread_id)
+            thread = resumable_thread(client, thread_id, allow_fresh=True)
             print(json.dumps({"connected": True, "thread": thread["id"],
-                              "resumable": True, "cwd": thread.get("cwd"),
+                              "resumable": not thread.get("relay_fresh", False),
+                              "ready": True, "cwd": thread.get("cwd"),
                               "status": thread.get("status")}, indent=2))
         finally:
             client.close()

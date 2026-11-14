@@ -34,7 +34,7 @@ class DiscoveryTests(unittest.TestCase):
                 patch.object(relay.os, 'kill', side_effect=[None, ProcessLookupError()]):
             self.assertEqual([s['id'] for s in relay.discover_claude()], ['live'])
 
-    def test_codex_lists_blank_threads_but_does_not_select_them(self):
+    def test_codex_lists_blank_loaded_threads_as_ready_without_model_requests(self):
         client = MagicMock()
         client.call.return_value = {'data': ['live', 'blank', 'old', 'worker', 'closing']}
         client.thread.side_effect = [
@@ -48,7 +48,8 @@ class DiscoveryTests(unittest.TestCase):
         with patch.object(relay, 'CodexClient', return_value=client):
             sessions = relay.discover_codex()
         self.assertEqual([s['id'] for s in sessions], ['live', 'blank'])
-        self.assertEqual([s['ready'] for s in sessions], [True, False])
+        self.assertEqual([s['ready'] for s in sessions], [True, True])
+        self.assertEqual([s['fresh'] for s in sessions], [False, True])
         self.assertEqual(sessions[0]['name'], 'My review')
         client.close.assert_called_once()
         self.assertTrue(all(call.args[0] != 'turn/start' for call in client.call.call_args_list))
@@ -75,28 +76,47 @@ class DiscoveryTests(unittest.TestCase):
                 patch('sys.stdout', new_callable=io.StringIO):
             self.assertEqual(relay.choose_session('Codex', sessions, '/repo'), 'two')
 
-    def test_other_checkout_and_blank_session_are_not_auto_linked(self):
+    def test_link_does_not_choose_other_checkout_but_accepts_blank_session(self):
         with patch.object(relay, 'checkout', side_effect=lambda p: Path(p)), \
                 patch.object(relay.sys.stdin, 'isatty', return_value=False):
             with self.assertRaisesRegex(ValueError, 'Cannot automatically choose'):
                 relay.choose_session('Codex', [session('Codex', 'other', '/other')], '/repo')
-            with self.assertRaisesRegex(ValueError, 'Send one prompt'):
-                relay.choose_session('Codex', [session('Codex', 'blank', '/repo', False)], '/repo')
+            self.assertEqual(relay.choose_session('Codex', [session('Codex', 'blank', '/repo')], '/repo'), 'blank')
 
-    def test_missing_rollout_fails_before_settings_or_link_are_written(self):
+    def test_fresh_loaded_thread_links_and_queues_setup_without_a_first_prompt(self):
         client = MagicMock()
+        client.thread.return_value = {'id': '22222222-2222-4222-8222-222222222222',
+                                      'cwd': '/repo', 'status': {'type': 'idle'}}
         client.call.side_effect = RuntimeError('thread/resume: no rollout found for thread id')
         with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(relay.Path, 'home', return_value=Path(tmp)), \
+                patch.object(relay, 'ROOT', Path(tmp) / 'state'), \
+                patch.object(relay, 'CONFIG', Path(tmp) / 'state/config.json'), \
                 patch.object(relay, 'CodexClient', return_value=client), \
+                patch.object(relay, 'terminal_for_claude', return_value=None), \
+                patch.object(relay, 'start_worker') as startup, \
+                patch('sys.stdout', new_callable=io.StringIO):
+            args = argparse.Namespace(claude='11111111-1111-4111-8111-111111111111',
+                                      codex='22222222-2222-4222-8222-222222222222',
+                                      repo=tmp, rounds=3, timeout=600)
+            relay.install(args)
+            self.assertEqual(relay.read_json(relay.CONFIG)['codex'], args.codex)
+            startup.assert_called_once()
+            self.assertFalse(any(call.args[0] == 'turn/start' for call in client.call.call_args_list))
+        client.close.assert_called_once()
+
+    def test_unloaded_thread_still_fails_before_settings_are_written(self):
+        client = MagicMock()
+        client.thread.return_value = {'status': {'type': 'notLoaded'}}
+        with patch.object(relay, 'CodexClient', return_value=client), \
                 patch.object(relay, 'terminal_for_claude', return_value=None), \
                 patch.object(relay, 'write_json') as write:
             args = argparse.Namespace(claude='11111111-1111-4111-8111-111111111111',
                                       codex='22222222-2222-4222-8222-222222222222',
-                                      repo=tmp, rounds=3, timeout=600)
-            with self.assertRaisesRegex(ValueError, 'send one prompt'):
+                                      repo='/tmp', rounds=3, timeout=600)
+            with self.assertRaisesRegex(ValueError, 'open it before linking'):
                 relay.install(args)
             write.assert_not_called()
-        client.close.assert_called_once()
 
     def test_partial_discovery_failure_preserves_other_agent_results(self):
         found = [session('Claude', 'live', '/repo')]
@@ -137,12 +157,95 @@ class DiscoveryTests(unittest.TestCase):
             startup.assert_called_once_with(config)
             self.assertFalse(any(call.args[0] == 'turn/start' for call in client.call.call_args_list))
 
-    def test_default_repo_requires_checkout(self):
-        with tempfile.TemporaryDirectory() as tmp, \
-                patch.object(relay.Path, 'cwd', return_value=Path(tmp)):
-            args = argparse.Namespace(claude=None, codex=None, repo=None, rounds=3, timeout=600)
-            with self.assertRaisesRegex(ValueError, 'from a Git checkout'):
+    def test_here_finds_pair_outside_callers_directory_and_excludes_the_caller(self):
+        sessions = [session('Codex', 'caller', '/home'),
+                    session('Claude', 'new-claude', '/work'), session('Codex', 'blank', '/work')]
+        with patch.object(relay, 'checkout', side_effect=lambda p: Path(p)), \
+                patch.dict(relay.os.environ, {'CODEX_THREAD_ID': 'caller'}):
+            self.assertEqual(relay.choose_pair(sessions), ('/work', 'new-claude', 'blank'))
+            sessions.append(session('Claude', 'home-claude', '/home'))
+            self.assertEqual(relay.choose_pair(sessions), ('/work', 'new-claude', 'blank'))
+
+    def test_here_prefers_new_pair_to_previous_link(self):
+        sessions = [session('Claude', 'old-c', '/old'), session('Codex', 'old-x', '/old'),
+                    session('Claude', 'new-c', '/new'), session('Codex', 'new-x', '/new')]
+        with patch.object(relay, 'checkout', side_effect=lambda p: Path(p)):
+            self.assertEqual(relay.choose_pair(sessions, previous={'claude': 'old-c', 'codex': 'old-x'}),
+                             ('/new', 'new-c', 'new-x'))
+            for s in sessions:
+                s['cwd'] = '/same-workspace'
+            self.assertEqual(relay.choose_pair(sessions, previous={'claude': 'old-c', 'codex': 'old-x'}),
+                             ('/same-workspace', 'new-c', 'new-x'))
+
+    def test_here_requires_selection_for_multiple_new_pairs(self):
+        sessions = [session('Claude', 'c1', '/one'), session('Codex', 'x1', '/one'),
+                    session('Claude', 'c2', '/two'), session('Codex', 'x2', '/two')]
+        with patch.object(relay, 'checkout', side_effect=lambda p: Path(p)), \
+                patch.object(relay.sys.stdin, 'isatty', return_value=False):
+            with self.assertRaisesRegex(ValueError, 'Multiple terminal pairs'):
+                relay.choose_pair(sessions)
+            self.assertEqual(relay.choose_pair(sessions, repo='/two'), ('/two', 'c2', 'x2'))
+
+    def test_here_never_combines_sessions_from_different_workspaces(self):
+        sessions = [session('Claude', 'c1', '/one'), session('Codex', 'x1', '/two')]
+        with patch.object(relay, 'checkout', side_effect=lambda p: Path(p)):
+            with self.assertRaisesRegex(ValueError, 'same workspace'):
+                relay.choose_pair(sessions)
+
+    def test_here_connects_non_git_workspace_and_queues_actual_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            workspace = root / 'applications'
+            workspace.mkdir()
+            task = root / 'task.txt'
+            task.write_text('Read the PDF.\nPrepare interview next steps.')
+            c = '11111111-1111-4111-8111-111111111111'
+            x = '22222222-2222-4222-8222-222222222222'
+            sessions = [session('Claude', c, workspace), session('Codex', x, workspace)]
+            client = MagicMock()
+            client.thread.return_value = {'id': x, 'cwd': str(workspace), 'status': {'type': 'idle'}}
+            args = argparse.Namespace(command='here', claude=None, codex=None, repo=None,
+                                      initiator='claude', exclude=[], task_file=str(task), rounds=3, timeout=600)
+            with patch.object(relay.Path, 'home', return_value=root / 'test-home'), \
+                    patch.object(relay, 'ROOT', root / 'state'), \
+                    patch.object(relay, 'CONFIG', root / 'state/config.json'), \
+                    patch.object(relay, 'discover_sessions', return_value=(sessions, [])), \
+                    patch.object(relay, 'CodexClient', return_value=client), \
+                    patch.object(relay, 'terminal_for_claude', return_value={'transport': 'iterm', 'pid': 7}), \
+                    patch.object(relay, 'start_worker') as start, \
+                    patch('sys.stdout', new_callable=io.StringIO):
                 relay.install(args)
+                config = relay.read_json(relay.CONFIG)
+                queued = relay.read_json(relay.ROOT / 'tasks' / (config['task_id'] + '.json'))
+                self.assertEqual(config['repo'], str(workspace))
+                self.assertEqual(queued['prompt'], task.read_text())
+                self.assertEqual(queued['epoch'], relay.read_json(relay.state_path(c))['epoch'])
+                start.assert_called_once_with(config)
+
+    def test_here_reconnecting_same_pair_preserves_current_task(self):
+        c = '11111111-1111-4111-8111-111111111111'
+        x = '22222222-2222-4222-8222-222222222222'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            config = {'enabled': True, 'claude': c, 'codex': x, 'repo': str(root),
+                      'initiator': 'claude', 'link_id': 'existing'}
+            client = MagicMock()
+            client.thread.return_value = {'id': x, 'cwd': str(root), 'status': {'type': 'idle'}}
+            args = argparse.Namespace(command='here', claude=None, codex=None, repo=None,
+                                      initiator='claude', exclude=[], task_file=None, rounds=3, timeout=600)
+            with patch.object(relay, 'ROOT', root), patch.object(relay, 'CONFIG', root / 'config.json'), \
+                    patch.object(relay, 'discover_sessions', return_value=([session('Claude', c, root), session('Codex', x, root)], [])), \
+                    patch.object(relay, 'CodexClient', return_value=client), \
+                    patch.object(relay, 'terminal_for_claude', return_value=None), \
+                    patch.object(relay, 'start_worker') as start, \
+                    patch('sys.stdout', new_callable=io.StringIO):
+                relay.write_json(relay.CONFIG, config)
+                state = {'epoch': 'human-task', 'prompt': 'Actual task', 'pending': 'review'}
+                relay.write_json(relay.state_path(c), state)
+                relay.install(args)
+                self.assertEqual(relay.read_json(relay.CONFIG), config)
+                self.assertEqual(relay.read_json(relay.state_path(c)), state)
+                start.assert_not_called()
 
 
 if __name__ == '__main__':

@@ -42,8 +42,6 @@ cd /path/to/repository
 codex
 ~~~
 
-Send one prompt in the Codex terminal, such as `Ready to review.` A brand-new Codex session needs a saved conversation before the daemon can resume it.
-
 From another shell in the same repository:
 
 ~~~bash
@@ -51,9 +49,34 @@ ai-relay sessions
 ai-relay link
 ~~~
 
-`sessions` detects running interactive Claude processes and Codex sessions loaded in the local daemon. It shows their IDs, directories, status, and names. Blank Codex sessions are listed with instructions to send a prompt first. Discovery sends no model requests.
+`sessions` detects running interactive Claude processes and Codex sessions loaded in the local daemon. It shows their IDs, directories, status, and names. Fresh Codex terminals are ready to connect without typing an initial message. Discovery sends no model requests; the startup announcement initializes the selected conversation when needed.
 
-`link` automatically selects a ready session for each agent in the current checkout, including subdirectories. If several match, it asks you to select from a numbered list. It never guesses between multiple sessions. When none match, an interactive shell lets you choose from sessions in other directories. Scripts must provide IDs for ambiguous selections.
+`link` automatically selects a running session for each agent in the current workspace, including subdirectories of a Git checkout. Workspaces without Git are also supported. If several match, it asks you to select from a numbered list. When none match, an interactive shell lets you choose from sessions in other directories. Scripts must provide IDs for ambiguous selections.
+
+To connect the terminals you just opened from any directory, run:
+
+~~~bash
+ai-relay here
+~~~
+
+`here` detects Claude and Codex in a shared workspace. It prefers a new pair over the previous link, excludes the calling Codex session using `CODEX_THREAD_ID`, and asks for selection when multiple pairs remain. You can narrow selection with `--repo` or `--claude/--codex`. Reconnecting the same pair preserves its current task.
+
+To connect and send a task into the participating initiator terminal in one step:
+
+~~~bash
+ai-relay here --initiator claude --task-file /path/to/task.txt
+~~~
+
+The file contains the actual task, with normal UTF-8 text and newlines. Delivery waits for busy sessions and preserves unsent input. Claude receives a bracketed paste in its iTerm2 or tmux terminal; Codex receives a new turn in its existing terminal conversation. A queued task is canceled if the link changes or a newer Claude prompt supersedes it. Role announcements alone do not start the task.
+
+For requests from a separate Codex conversation, install the included skill so “connect the terminals I opened and do this there” uses the same flow:
+
+~~~bash
+mkdir -p "$HOME/.codex/skills/ai-relay"
+cp skills/ai-relay/SKILL.md "$HOME/.codex/skills/ai-relay/SKILL.md"
+~~~
+
+The skill is available in new Codex sessions after installation. It routes requests involving the relay to `here` and verifies actual delivery; it does not redirect unrelated tasks.
 
 At startup, `link` asks who leads:
 
@@ -77,7 +100,7 @@ ai-relay link \
   --rounds 3
 ~~~
 
-The connection is checked for resumability before settings are changed. It forwards completed answers rather than terminal scrollback or intermediate progress. In Codex mode a detached watcher observes new human tasks, delivers a review prompt to the selected Claude terminal, and returns its matching review to Codex. It skips historical tasks, setup turns, and relay-generated turns. It waits for busy sessions and preserves unsent Claude input.
+The connection is checked for a live, input-capable Codex thread before settings are changed. It forwards completed answers rather than terminal scrollback or intermediate progress. In Codex mode a detached watcher observes new human tasks, delivers a review prompt to the selected Claude terminal, and returns its matching review to Codex. It skips historical tasks, setup turns, and relay-generated turns. It waits for busy sessions and preserves unsent Claude input.
 
 `link` registers session-specific handlers in your Claude settings, preserving existing hooks and saving a backup. It connects one pair at a time. A new task in the same pair only needs a new initiator prompt; fresh sessions require linking again.
 
@@ -90,6 +113,7 @@ Routine reviewer disagreements should end in a decision within the existing task
 | `ai-relay sessions` | Detect Claude processes and loaded Codex sessions. |
 | `ai-relay sessions --json` | Return detected sessions and discovery problems for scripts. |
 | `ai-relay link` | Detect and connect sessions for the current checkout. |
+| `ai-relay here [--task-file PATH]` | Detect a new pair across workspaces and optionally deliver the task. |
 | `ai-relay status` | Show the linked sessions and recent exchanges. |
 | `ai-relay decisions` | Show the latest initiator decision in a prominent TL;DR panel. |
 | `ai-relay doctor` | Check daemon connectivity and session resumability without sending a model request. |

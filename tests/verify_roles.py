@@ -186,6 +186,60 @@ class RoleTests(unittest.TestCase):
         watch.assert_called_once_with(client, self.config, {'old'})
         client.close.assert_called_once()
 
+    def test_multiline_context_is_delivered_as_one_message_file(self):
+        config = {**self.config, 'claude_terminal': {'transport': 'iterm', 'tty': '/dev/test', 'pid': 7}}
+        prompt = '[AI_RELAY_SETUP test-link]\n' + relay.role_context(config, 'claude')
+        def receive_file(command, **kwargs):
+            self.assertEqual(Path(command[-1]).read_text(), prompt)
+            return subprocess.CompletedProcess([], 0, 'sent', '')
+        with patch.object(relay, 'discover_claude', return_value=[{'id': CLAUDE, 'pid': 7, 'status': 'idle'}]), \
+                patch.object(relay, 'terminal_screen', return_value='❯ \n────'), \
+                patch.object(relay.subprocess, 'run', side_effect=receive_file):
+            relay.send_claude(config, prompt, lambda: True)
+
+    def test_queued_task_delivers_to_participating_claude_and_cancels_on_new_human_prompt(self):
+        self.config['initiator'] = 'claude'
+        relay.write_json(relay.CONFIG, self.config)
+        relay.write_json(relay.state_path(CLAUDE), {'epoch': 'task-epoch'})
+        task_id = relay.queue_task(self.config, 'Read the PDF and prepare next steps.', start=False)
+        with patch.object(relay, 'send_claude') as send:
+            relay.task_worker(task_id)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[1], 'Read the PDF and prepare next steps.')
+        self.assertTrue(send.call_args.args[2]())
+        relay.write_json(relay.state_path(CLAUDE), {'epoch': 'new-human-task'})
+        with patch.object(relay, 'send_claude') as send:
+            relay.task_worker(task_id)
+        send.assert_not_called()
+
+    def test_queued_task_cannot_follow_a_changed_link(self):
+        relay.write_json(relay.state_path(CLAUDE), {'epoch': 'task-epoch'})
+        task_id = relay.queue_task(self.config, 'Original task', start=False)
+        relay.write_json(relay.CONFIG, {**self.config, 'link_id': 'replacement'})
+        with patch.object(relay, 'send_claude') as send, patch.object(relay, 'CodexClient') as client:
+            relay.task_worker(task_id)
+        send.assert_not_called()
+        client.assert_not_called()
+
+    def test_queued_codex_initiator_task_uses_its_existing_thread(self):
+        relay.write_json(relay.state_path(CLAUDE), {'epoch': 'task-epoch'})
+        task_id = relay.queue_task(self.config, 'Prepare the next interview.', start=False)
+        client = MagicMock()
+        def review(thread, prompt, **kwargs):
+            kwargs['on_start']('task-turn')
+            # The watcher may notice the completed origin before the worker receives its final event.
+            relay.write_json(relay.state_path(CLAUDE), {'epoch': 'watcher-review'})
+            self.assertTrue(factory.call_args.args[1]())
+            return '**TL;DR — Decision**\nDecided: Prepare the brief.', 'task-turn'
+        client.review.side_effect = review
+        with patch.object(relay, 'CodexClient', return_value=client) as factory, \
+                patch.object(relay, 'send_claude') as send:
+            relay.task_worker(task_id)
+        client.review.assert_called_once()
+        self.assertEqual(client.review.call_args.args, (CODEX, 'Prepare the next interview.'))
+        send.assert_not_called()
+        client.close.assert_called_once()
+
     def test_busy_claude_gets_hook_context_while_codex_notice_still_runs(self):
         self.config['claude_terminal'] = {'transport': 'iterm', 'tty': '/dev/test', 'pid': 7}
         relay.write_json(relay.CONFIG, self.config)

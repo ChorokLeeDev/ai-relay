@@ -93,6 +93,7 @@ def serve():
             continue
         with connection:
             try:
+                silent_turn = None
                 header = b''
                 while b'\r\n\r\n' not in header:
                     header += connection.recv(4096)
@@ -110,14 +111,27 @@ def serve():
                     if method == 'initialize':
                         send(connection, {'id': message['id'], 'result': {}})
                     elif method in ('thread/read', 'thread/resume'):
+                        if mode == 'fresh' and method == 'thread/resume':
+                            send(connection, {'id': message['id'], 'error': {'message': 'no rollout found for thread id'}})
+                            continue
+                        turns = []
+                        if mode == 'fresh' and silent_turn and message['params'].get('includeTurns'):
+                            turns = [{'id': 'unrelated', 'status': 'completed', 'items': [
+                                {'type': 'agentMessage', 'text': 'Wrong turn'}]},
+                                {'id': silent_turn, 'status': 'completed', 'items': [
+                                    {'type': 'agentMessage', 'phase': 'commentary', 'text': 'Progress'},
+                                    {'type': 'agentMessage', 'phase': 'final_answer', 'text': 'Fresh session ready'}]}]
                         send(connection, {'id': message['id'], 'result': {'thread': {
                             'id': codex, 'cwd': '/test/project',
-                            'status': {'type': 'active' if mode == 'busy' else 'idle'}}}})
+                            'status': {'type': 'active' if mode == 'busy' else 'idle'}, 'turns': turns}}})
                     elif method == 'turn/start':
                         turn = 'test-turn-' + str(len(calls))
                         send(connection, {'method': 'turn/completed', 'params': {
                             'threadId': 'unrelated-thread', 'turn': {'id': 'other', 'status': 'completed'}}})
                         send(connection, {'id': message['id'], 'result': {'turn': {'id': turn}}})
+                        if mode == 'fresh':
+                            silent_turn = turn
+                            continue
                         if mode == 'approval':
                             send(connection, {'id': 'server-approval', 'method': 'item/commandExecution/requestApproval',
                                               'params': {'threadId': codex, 'turnId': turn}})
@@ -185,6 +199,16 @@ try:
     assert len([call for call in calls if call['method'] == 'turn/start']) == count + 1
     events = [json.loads(line) for line in (relay.ROOT / 'events.jsonl').read_text().splitlines()]
     assert any(item['event'] == 'waiting_for_codex' for item in events)
+    assert not any(call['method'] == 'turn/interrupt' for call in calls)
+    mode = 'fresh'
+    client = relay.CodexClient(timeout=10)
+    try:
+        client.initialize()
+        reply, fresh_turn = client.review(codex, '[AI_RELAY_SETUP test] Acknowledge only.')
+        assert reply == 'Fresh session ready'
+        assert client.finished
+    finally:
+        client.close()
     assert not any(call['method'] == 'turn/interrupt' for call in calls)
     mode = 'approval'
     relay.hook(event)
