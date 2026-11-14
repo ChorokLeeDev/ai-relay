@@ -88,6 +88,7 @@ class DiscoveryTests(unittest.TestCase):
         client.call.side_effect = RuntimeError('thread/resume: no rollout found for thread id')
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(relay, 'CodexClient', return_value=client), \
+                patch.object(relay, 'terminal_for_claude', return_value=None), \
                 patch.object(relay, 'write_json') as write:
             args = argparse.Namespace(claude='11111111-1111-4111-8111-111111111111',
                                       codex='22222222-2222-4222-8222-222222222222',
@@ -125,12 +126,15 @@ class DiscoveryTests(unittest.TestCase):
                     patch.object(relay, 'CONFIG', state / 'config.json'), \
                     patch.object(relay, 'discover_sessions', return_value=(sessions, [])), \
                     patch.object(relay, 'CodexClient', return_value=client), \
+                    patch.object(relay, 'terminal_for_claude', return_value=None), \
+                    patch.object(relay, 'start_worker') as startup, \
                     patch('sys.stdout', new_callable=io.StringIO):
                 relay.install(args)
                 config = relay.read_json(relay.CONFIG)
             self.assertEqual(config['claude'], claude_id)
             self.assertEqual(config['codex'], codex_id)
             self.assertEqual(config['repo'], str(root))
+            startup.assert_called_once_with(config)
             self.assertFalse(any(call.args[0] == 'turn/start' for call in client.call.call_args_list))
 
     def test_default_repo_requires_checkout(self):

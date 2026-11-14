@@ -1,6 +1,6 @@
 # ai-relay
 
-Automatically pass completed Claude Code replies to an existing Codex session for review, then return the review to Claude so it can address valid findings.
+Connect existing Claude Code and Codex terminals, choose who leads, and automatically exchange completed replies for peer review.
 
 The prompt works across repositories. Each handoff includes the selected checkout, current commit, branch, working-tree status, and latest human instruction. Review dialogue stays in the terminal; authorized PR updates should be short, factual English notes.
 
@@ -10,6 +10,7 @@ The prompt works across repositories. Each handoff includes the selected checkou
 - Installed, authenticated Claude Code and Codex CLIs.
 - Claude Code command hooks and `claude agents --json` support.
 - Codex's shared local app-server daemon with its WebSocket control socket. Start Codex normally so the relay can connect to the same daemon.
+- For **Codex initiation**, the Claude terminal must be in iTerm2 on macOS or a tmux pane. Claude initiation also works through Claude hooks without a supported terminal bridge.
 
 The script uses only Python's standard library. Existing session permissions apply; the review prompt asks Codex to inspect without changing files or writing to external services.
 
@@ -54,6 +55,18 @@ ai-relay link
 
 `link` automatically selects a ready session for each agent in the current checkout, including subdirectories. If several match, it asks you to select from a numbered list. It never guesses between multiple sessions. When none match, an interactive shell lets you choose from sessions in other directories. Scripts must provide IDs for ambiguous selections.
 
+At startup, `link` asks who leads:
+
+~~~text
+AI RELAY — who leads this session?
+  1. Claude initiates; Codex reviews (default)
+  2. Codex initiates; Claude reviews
+~~~
+
+Give the task to the selected initiator. The other session reviews its completed answer and the initiator evaluates that feedback. For scripts or a preset role, use `ai-relay link --initiator codex` or `--initiator claude`; noninteractive invocations default to Claude.
+
+Both agents receive their role and relay instructions automatically. The relay queues a short startup acknowledgment in Codex. It also sends one to Claude when its supported terminal is idle with an empty prompt; otherwise Claude receives the same context through its next session-start, human-prompt, or tool hook. You do not need to explain the relay for each task. Startup acknowledgments are excluded from review cycles. These announcements make small model requests; session discovery and `doctor` do not.
+
 For a separate review checkout, use `ai-relay link --repo /path/to/checkout`. You can still specify either or both session IDs:
 
 ~~~bash
@@ -64,9 +77,11 @@ ai-relay link \
   --rounds 3
 ~~~
 
-The connection is checked for resumability before settings are changed. Then give Claude the task. The relay sends its completed answer to Codex, waits for that specific review turn to complete, and returns the final review to Claude. It forwards completed answers rather than terminal scrollback or intermediate progress.
+The connection is checked for resumability before settings are changed. It forwards completed answers rather than terminal scrollback or intermediate progress. In Codex mode a detached watcher observes new human tasks, delivers a review prompt to the selected Claude terminal, and returns its matching review to Codex. It skips historical tasks, setup turns, and relay-generated turns. It waits for busy sessions and preserves unsent Claude input.
 
-`link` registers session-specific handlers in your Claude settings, preserving existing hooks and saving a backup. It connects one pair at a time. A new task in the same pair only needs a new Claude prompt; fresh sessions require linking their new IDs.
+`link` registers session-specific handlers in your Claude settings, preserving existing hooks and saving a backup. It connects one pair at a time. A new task in the same pair only needs a new initiator prompt; fresh sessions require linking again.
+
+Routine reviewer disagreements should end in a decision within the existing task scope. The initiator is instructed to lead decision reports with **TL;DR — Decision**, stating what was decided, why, and the next step. Necessary missing facts and approvals still require user input. The latest formatted decision is also available with `ai-relay decisions`; it contains the initiator's summary, not the peer conversation.
 
 ## Controls
 
@@ -76,16 +91,17 @@ The connection is checked for resumability before settings are changed. Then giv
 | `ai-relay sessions --json` | Return detected sessions and discovery problems for scripts. |
 | `ai-relay link` | Detect and connect sessions for the current checkout. |
 | `ai-relay status` | Show the linked sessions and recent exchanges. |
+| `ai-relay decisions` | Show the latest initiator decision in a prominent TL;DR panel. |
 | `ai-relay doctor` | Check daemon connectivity and session resumability without sending a model request. |
 | `ai-relay off` | Disable forwarding and cancel any pending relay-owned review. |
-| `ai-relay retry` | Retry the saved reply after a failed review. |
+| `ai-relay retry` | Retry the saved reply after a failed Claude-initiated review. |
 | `ai-relay retry --request EXCHANGE_ID` | Explicitly retry a saved exchange, including after a newer Claude prompt. |
 
 By default, the relay waits up to 30 minutes for Codex's existing task to finish, then gives the review up to 10 minutes. Configure these separately with `link --wait-timeout SECONDS --timeout SECONDS`.
 
 Each human prompt allows up to three exchanges by default. A reviewer ending with `[AI_RELAY_DONE]` or `[AI_RELAY_USER]` ends the automatic cycle. A request for human approval, interruption, or timeout leaves the review incomplete. A new human prompt supersedes the previous exchange; use an explicit retry if you still want that saved reply reviewed.
 
-Retry workers run detached under `nohup`. A retry's result returns through Claude's next matching Stop hook or next human prompt; it cannot wake an already-idle Claude session on its own.
+Startup, watcher, and retry workers run detached under `nohup`. A retry's result returns through Claude's next matching Stop hook or next human prompt; it cannot wake an already-idle Claude session on its own. The Codex-mode terminal bridge handles waking its Claude reviewer.
 
 Settings, backups, prompts, replies, and logs are stored locally in `~/.local/share/ai-relay/`. The relay reads Claude's settings from `~/.claude/settings.json` and Codex's control socket from `$CODEX_HOME/app-server-control/app-server-control.sock`, defaulting to `~/.codex/`. Those local records are not part of this repository.
 
@@ -94,8 +110,9 @@ Settings, backups, prompts, replies, and logs are stored locally in `~/.local/sh
 ~~~bash
 python3 tests/verify_relay.py
 python3 tests/verify_discovery.py
+python3 tests/verify_roles.py
 ~~~
 
-The checks use a mock Unix WebSocket server, synthetic session IDs, and a temporary home directory. They verify message framing, completed-turn correlation, long and fragmented replies, busy-to-idle waiting, round limits, approval handling, saved feedback delivery, and preservation of existing settings. Discovery checks cover closed Claude processes, blank Codex threads, checkout matching, ambiguous selections, and failed connections leaving settings untouched. They send no model requests and do not alter your live configuration.
+The checks use a mock Unix WebSocket server, synthetic session IDs, and a temporary home directory. They verify message framing, completed-turn correlation, long and fragmented replies, busy-to-idle waiting, round limits, approval handling, saved feedback delivery, and preservation of existing settings. Discovery and role checks cover closed processes, blank threads, checkout matching, startup choice and announcements, Codex-to-Claude-to-Codex handoffs, superseded tasks, draft preservation, and decision reports. They send no model requests and do not alter your live configuration.
 
 Protocol references: [Codex App Server](https://developers.openai.com/codex/app-server/), [Codex slash commands](https://developers.openai.com/codex/cli/slash-commands/), and [Claude Code hooks](https://code.claude.com/docs/en/hooks).

@@ -11,6 +11,7 @@ import struct
 import tempfile
 import threading
 import time
+from unittest.mock import patch
 
 loader = importlib.machinery.SourceFileLoader('ai_relay', str(Path(__file__).resolve().parents[1] / 'ai-relay'))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -226,13 +227,32 @@ try:
     preserved = {'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': '/existing/status'}]}]}, 'custom': 'preserve me'}
     relay.write_json(settings, preserved)
     arguments = argparse.Namespace(claude=claude, codex=codex, repo=str(folder), rounds=2, timeout=10)
-    relay.install(arguments)
-    relay.install(arguments)
+    with patch.object(relay, 'start_worker'), patch.object(relay, 'terminal_for_claude', return_value=None):
+        relay.install(arguments)
+        relay.install(arguments)
     installed = relay.read_json(settings)
     assert installed['custom'] == preserved['custom']
     assert installed['hooks']['Stop'][0] == preserved['hooks']['Stop'][0]
     assert len(installed['hooks']['Stop']) == 2
     assert len(installed['hooks']['UserPromptSubmit']) == 1
+    assert len(installed['hooks']['SessionStart']) == 1
+    # Startup and Codex initiation reuse a client: a later approval must still
+    # interrupt only its new relay-owned turn, even after an earlier completed turn.
+    mode = 'feedback'
+    client = relay.CodexClient(timeout=10)
+    client.initialize()
+    client.review(codex, 'First setup turn')
+    mode = 'approval'
+    interrupts = len([call for call in calls if call['method'] == 'turn/interrupt'])
+    try:
+        client.review(codex, 'Later relay turn')
+        raise AssertionError('Approval request should stop the later review')
+    except RuntimeError as exc:
+        assert 'human approval' in str(exc)
+    finally:
+        client.close()
+    time.sleep(0.1)
+    assert len([call for call in calls if call['method'] == 'turn/interrupt']) == interrupts + 1
     assert not errors, errors
     print('PASS: existing transport checks, busy-to-idle waiting without interruption, review started once after idle, final-output-only forwarding, round limits, saved feedback delivery on next Claude prompt, human-approval stop, disabling, preserved settings.', flush=True)
     print('Artifacts:', folder, flush=True)
