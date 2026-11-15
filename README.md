@@ -67,7 +67,7 @@ To connect and send a task into the participating initiator terminal in one step
 ai-relay here --initiator claude --task-file /path/to/task.txt
 ~~~
 
-The file contains the actual task, with normal UTF-8 text and newlines. Delivery waits for busy sessions and preserves unsent input. Claude receives a bracketed paste in its iTerm2 or tmux terminal; Codex receives a new turn in its existing terminal conversation. A queued task is canceled if the link changes or a newer Claude prompt supersedes it. Role announcements alone do not start the task.
+The file contains the actual task, with normal UTF-8 text and newlines. Delivery waits for busy sessions and preserves unsent input. Claude receives a bracketed paste in its iTerm2 or tmux terminal; Codex receives a new turn in its existing terminal conversation. Claude task delivery runs independently of Codex's startup acknowledgment. An empty Claude prompt showing “Waiting for … background agent(s) to finish” can receive the task even when session discovery reports busy; active work and permission dialogs still wait. A queued task is canceled if the link changes or a newer human Claude prompt supersedes it. Background completion notifications preserve the human task and its queued work. Role announcements alone do not start the task.
 
 For requests from a separate Codex conversation, install the included skill so “connect the terminals I opened and do this there” uses the same flow:
 
@@ -123,7 +123,7 @@ Routine reviewer disagreements should end in a decision within the existing task
 
 By default, the relay waits up to 30 minutes for Codex's existing task to finish, then gives the review up to 10 minutes. Configure these separately with `link --wait-timeout SECONDS --timeout SECONDS`.
 
-Each human prompt allows up to three exchanges by default. A reviewer ending with `[AI_RELAY_DONE]` or `[AI_RELAY_USER]` ends the automatic cycle. A request for human approval, interruption, or timeout leaves the review incomplete. A new human prompt supersedes the previous exchange; use an explicit retry if you still want that saved reply reviewed.
+Each human prompt allows up to three exchanges by default. Either agent ending with `[AI_RELAY_DONE]` or `[AI_RELAY_USER]` ends the automatic cycle, allowing Claude to yield after its conclusion instead of starting another Stop-hook review. Waiting summaries with live background tasks are not sent for peer review; the completed result is reviewed when the background work finishes. A request for human approval, interruption, or timeout leaves the review incomplete. A new human prompt supersedes the previous exchange; use an explicit retry if you still want that saved reply reviewed.
 
 Startup, watcher, and retry workers run detached under `nohup`. A retry's result returns through Claude's next matching Stop hook or next human prompt; it cannot wake an already-idle Claude session on its own. The Codex-mode terminal bridge handles waking its Claude reviewer.
 

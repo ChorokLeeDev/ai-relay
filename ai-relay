@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import shlex
 import socket
@@ -669,6 +670,16 @@ def empty_claude_prompt(screen):
     return True
 
 
+def waiting_for_background(screen):
+    # Use the current footer, not an old waiting message in the scrollback.
+    for line in reversed(screen.rsplit("❯", 1)[0].splitlines()):
+        line = line.strip()
+        if not line or line.startswith("──") or re.fullmatch(r"[\d,]+ tokens", line):
+            continue
+        return bool(re.fullmatch(r"[✻✽✶✳✢*·]?\s*Waiting for \d+ background agents? to finish", line))
+    return False
+
+
 def send_claude(config, text, current, timeout=None):
     terminal = config.get("claude_terminal")
     if not terminal:
@@ -678,7 +689,10 @@ def send_claude(config, text, current, timeout=None):
         agents = [a for a in discover_claude() if a["id"] == config["claude"]]
         if not agents or agents[0]["pid"] != terminal["pid"]:
             raise RuntimeError("The linked Claude terminal changed; relink the sessions.")
-        if agents[0]["status"] == "idle" and empty_claude_prompt(terminal_screen(terminal)):
+        status = agents[0]["status"]
+        screen = terminal_screen(terminal) if status in ("idle", "busy") else ""
+        ready = status == "idle" or (status == "busy" and waiting_for_background(screen))
+        if ready and empty_claude_prompt(screen) and current():
             if terminal["transport"] == "iterm":
                 ROOT.mkdir(parents=True, exist_ok=True)
                 with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=ROOT, suffix=".txt") as message:
@@ -754,6 +768,10 @@ def hook(event):
         with state_lock(session):
             previous = read_json(path, {})
             prompt = event.get("prompt", "")
+            if prompt.lstrip().startswith("<task-notification>"):
+                # Background completion belongs to the existing human task.
+                # Resetting its epoch cancels queued work and drops its instructions.
+                return {"hookSpecificOutput": {"hookEventName": kind, "additionalContext": role_notice}}
             if prompt.startswith(f"[AI_RELAY_SETUP {config.get('link_id')}]"):
                 previous["setup_turn"] = True
                 previous["claude_notified"] = True
@@ -798,6 +816,18 @@ def hook(event):
                 write_json(path, state)
             return {}
     save_decision(config, event["last_assistant_message"])
+    if (not event.get("_retry_worker")
+            and event["last_assistant_message"].rstrip().endswith(("[AI_RELAY_DONE]", "[AI_RELAY_USER]"))):
+        with state_lock(session):
+            state = read_json(path, {})
+            state["done"] = True
+            state["status"] = "concluded"
+            write_json(path, state)
+        return {}
+    if any(task.get("status") in ("running", "pending", "queued")
+           for task in event.get("background_tasks", [])):
+        # A waiting summary is not a finished answer to peer-review.
+        return {}
     if not event.get("_retry_worker"):
         saved = saved_feedback(session, config)
         if saved is not None:
@@ -1042,11 +1072,21 @@ def watch_codex(client, config, seen):
 
 
 def start_worker(config):
+    if config.get("task_id") and config.get("initiator", "claude") == "claude":
+        start_task_worker(config["task_id"])
     ROOT.mkdir(parents=True, exist_ok=True)
     with (ROOT / "startup.log").open("a") as log:
         process = subprocess.Popen(["nohup", sys.executable, SCRIPT, "_start", config["link_id"]],
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     print(f"Role announcements queued (PID {process.pid}); log: {ROOT / 'startup.log'}")
+
+
+def start_task_worker(task_id):
+    ROOT.mkdir(parents=True, exist_ok=True)
+    with (ROOT / "tasks.log").open("a") as log:
+        process = subprocess.Popen(["nohup", sys.executable, SCRIPT, "_task", task_id],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    print(f"Task worker started (PID {process.pid}); log: {ROOT / 'tasks.log'}")
 
 
 def queue_task(config, prompt, start=True):
@@ -1055,10 +1095,7 @@ def queue_task(config, prompt, start=True):
                {"link_id": config["link_id"], "prompt": prompt,
                 "epoch": read_json(state_path(config["claude"]), {}).get("epoch")})
     if start:
-        with (ROOT / "tasks.log").open("a") as log:
-            process = subprocess.Popen(["nohup", sys.executable, SCRIPT, "_task", task_id],
-                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-        print(f"Task queued for the {config.get('initiator', 'claude').title()} terminal (PID {process.pid}).")
+        start_task_worker(task_id)
     return task_id
 
 
@@ -1109,7 +1146,7 @@ def startup_worker(link_id):
     try:
         client.initialize()
         seen = {t["id"] for t in thread_turns(client, config["codex"]) if t.get("status") == "completed"}
-        if config.get("claude_terminal"):
+        if config.get("claude_terminal") and not config.get("task_id"):
             try:
                 send_claude(config, f"[AI_RELAY_SETUP {link_id}]\n" + role_context(config, "claude")
                     + "\nAcknowledge your role briefly. Do not start a task or forward this setup acknowledgment.",
@@ -1124,7 +1161,7 @@ def startup_worker(link_id):
                 + "\nAcknowledge your role briefly. Do not start a task or treat this setup as a review.",
                 wait_timeout=config.get("wait_timeout", 1800))
         record("codex_notified", link=link_id)
-        if config.get("task_id"):
+        if config.get("task_id") and config.get("initiator", "claude") == "codex":
             task_worker(config["task_id"])
         if config.get("initiator", "claude") == "codex":
             watch_codex(client, config, seen)
@@ -1238,7 +1275,8 @@ def install(args):
     if status_type(thread) == "active":
         print("Codex is working; the relay will wait for its current task to finish.")
     if prompt is not None:
-        print(f"Task queued for the {initiator.title()} terminal after role announcements.")
+        print(f"Task queued for the {initiator.title()} terminal"
+              + (" independently of reviewer startup." if initiator == "claude" else " after role announcements."))
     else:
         print(f"Give the task to {initiator.title()}. Maximum {args.rounds} exchanges per human prompt.")
     print("Status: ai-relay status\nDisable: ai-relay off")

@@ -167,7 +167,12 @@ try:
     assert not calls
     relay.hook(event)
     stop = {'session_id': claude, 'hook_event_name': 'Stop', 'last_assistant_message': 'Literal ' + chr(96) + 'text' + chr(96) + ' $(keep literal)\n전체 테스트 통과'}
-    first = relay.hook(stop)
+    epoch = relay.read_json(relay.state_path(claude))['epoch']
+    assert relay.hook({**stop, 'background_tasks': [{'type': 'agent', 'status': 'running'}]}) == {}
+    assert not any(call['method'] == 'turn/start' for call in calls)
+    relay.hook({**event, 'prompt': '<task-notification>Research finished.</task-notification>'})
+    assert relay.read_json(relay.state_path(claude))['epoch'] == epoch
+    first = relay.hook({**stop, 'background_tasks': [{'type': 'agent', 'status': 'completed'}]})
     context = first['hookSpecificOutput']['additionalContext']
     assert '현재 커밋 검토 결과' in context
     assert 'OLD COMMENTARY' not in context
@@ -176,6 +181,7 @@ try:
     assert set(start['params']) == {'threadId', 'input'}
     assert stop['last_assistant_message'] in start['params']['input'][0]['text']
     assert 'CHECKOUT AT HANDOFF' in start['params']['input'][0]['text']
+    assert event['prompt'] in start['params']['input'][0]['text']
     second = relay.hook({**stop, 'stop_hook_active': True})
     assert 'final automatic exchange' in second['hookSpecificOutput']['additionalContext'].lower()
     count = len([call for call in calls if call['method'] == 'turn/start'])

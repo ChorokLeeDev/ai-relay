@@ -71,6 +71,46 @@ class RoleTests(unittest.TestCase):
         self.assertIn('reviewer', start['hookSpecificOutput']['additionalContext'])
         self.assertEqual(relay.hook({'session_id': CODEX, 'hook_event_name': 'SessionStart'}), {})
 
+    def test_waiting_summary_is_not_reviewed_until_background_research_finishes(self):
+        self.config['initiator'] = 'claude'
+        relay.write_json(relay.CONFIG, self.config)
+        relay.write_json(relay.state_path(CLAUDE), {'epoch': 'research', 'round': 0,
+                                                 'prompt': 'Find a verified position.', 'done': False})
+        for status in ('running', 'pending', 'queued'):
+            with self.subTest(status=status), patch.object(relay, 'CodexClient') as client:
+                result = relay.hook({'session_id': CLAUDE, 'hook_event_name': 'Stop',
+                                     'last_assistant_message': 'Waiting for the researcher.',
+                                     'background_tasks': [{'type': 'agent', 'status': status}]})
+                self.assertEqual(result, {})
+                client.assert_not_called()
+                self.assertEqual(relay.read_json(relay.state_path(CLAUDE))['round'], 0)
+
+    def test_concluded_claude_reply_yields_without_another_stop_hook_review(self):
+        self.config['initiator'] = 'claude'
+        relay.write_json(relay.CONFIG, self.config)
+        for marker in ('[AI_RELAY_DONE]', '[AI_RELAY_USER]'):
+            relay.write_json(relay.state_path(CLAUDE), {'epoch': 'reviewed', 'round': 1, 'done': False})
+            with self.subTest(marker=marker), patch.object(relay, 'CodexClient') as client:
+                result = relay.hook({'session_id': CLAUDE, 'hook_event_name': 'Stop',
+                                     'last_assistant_message': 'Here is the final conclusion. ' + marker})
+                self.assertEqual(result, {})
+                client.assert_not_called()
+                self.assertTrue(relay.read_json(relay.state_path(CLAUDE))['done'])
+
+    def test_background_notification_keeps_human_instructions_and_queued_task(self):
+        self.config['initiator'] = 'claude'
+        relay.write_json(relay.CONFIG, self.config)
+        state = {'epoch': 'human-task', 'round': 0, 'prompt': 'Verify both fit criteria.', 'done': False}
+        relay.write_json(relay.state_path(CLAUDE), state)
+        task_id = relay.queue_task(self.config, 'Show the verified output here.', start=False)
+        relay.hook({'session_id': CLAUDE, 'hook_event_name': 'UserPromptSubmit',
+                    'prompt': '<task-notification>Background researcher finished.</task-notification>'})
+        self.assertEqual(relay.read_json(relay.state_path(CLAUDE)), state)
+        with patch.object(relay, 'send_claude') as send:
+            relay.task_worker(task_id)
+        send.assert_called_once()
+        self.assertTrue(send.call_args.args[2]())
+
     def test_setup_does_not_reset_task_or_trigger_peer_review(self):
         path = relay.state_path(CLAUDE)
         relay.write_json(path, {'epoch': 'original', 'round': 1, 'prompt': 'Real task', 'done': False})
@@ -169,6 +209,54 @@ class RoleTests(unittest.TestCase):
             relay.send_claude(config, literal, lambda: True)
         self.assertFalse(Path(run.call_args.args[0][-1]).exists())
         self.assertNotIn('shell', run.call_args.kwargs)
+
+    def test_busy_background_wait_accepts_task_at_empty_prompt(self):
+        config = {**self.config, 'claude_terminal': {'transport': 'iterm', 'tty': '/dev/test', 'pid': 7}}
+        screen = '✻ Waiting for 1 background agent to finish\n108653 tokens\n────\n❯ \n────\nstatus'
+        with patch.object(relay, 'discover_claude', return_value=[{'id': CLAUDE, 'pid': 7, 'status': 'busy'}]), \
+                patch.object(relay, 'terminal_screen', return_value=screen), \
+                patch.object(relay.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'sent', '')) as send:
+            relay.send_claude(config, 'Show the search results in this terminal.', lambda: True, timeout=0)
+        send.assert_called_once()
+
+    def test_background_wait_does_not_override_draft_active_work_or_permission(self):
+        config = {**self.config, 'claude_terminal': {'transport': 'iterm', 'tty': '/dev/test', 'pid': 7}}
+        screens = [
+            '✻ Waiting for 2 background agents to finish\n────\n❯ My draft\n────',
+            '✻ Waiting for 1 background agent to finish\n✢ Computing…\n────\n❯ \n────',
+            '✻ Waiting for 1 background agent to finish\nAllow tool?\n1. Allow\n────\n❯ \n────',
+            '✢ Computing…\n────\n❯ \n────',
+        ]
+        for screen in screens:
+            with self.subTest(screen=screen), \
+                    patch.object(relay, 'discover_claude', return_value=[{'id': CLAUDE, 'pid': 7, 'status': 'busy'}]), \
+                    patch.object(relay, 'terminal_screen', return_value=screen), \
+                    patch.object(relay.subprocess, 'run') as send:
+                with self.assertRaises(TimeoutError):
+                    relay.send_claude(config, 'Search results', lambda: True, timeout=0)
+                send.assert_not_called()
+
+    def test_claude_task_worker_starts_before_reviewer_role_worker(self):
+        config = {**self.config, 'initiator': 'claude', 'task_id': 'queued-task'}
+        def start_roles(*args, **kwargs):
+            task.assert_called_once_with('queued-task')
+            self.assertEqual(args[0][:2], ['nohup', relay.sys.executable])
+            return MagicMock(pid=99)
+        with patch.object(relay, 'start_task_worker') as task, \
+                patch.object(relay.subprocess, 'Popen', side_effect=start_roles) as roles:
+            relay.start_worker(config)
+        roles.assert_called_once()
+
+    def test_claude_startup_does_not_deliver_the_task_twice_or_paste_setup_over_it(self):
+        self.config.update({'initiator': 'claude', 'task_id': 'independent-task',
+                            'claude_terminal': {'transport': 'iterm', 'tty': '/dev/test', 'pid': 7}})
+        relay.write_json(relay.CONFIG, self.config)
+        with patch.object(relay, 'CodexClient', return_value=MagicMock()), \
+                patch.object(relay, 'thread_turns', return_value=[]), \
+                patch.object(relay, 'send_claude') as send, patch.object(relay, 'task_worker') as task:
+            relay.startup_worker('test-link')
+        send.assert_not_called()
+        task.assert_not_called()
 
     def test_startup_announces_both_roles_then_watches_codex(self):
         self.config['claude_terminal'] = {'transport': 'iterm', 'tty': '/dev/test', 'pid': 7}
