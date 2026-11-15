@@ -187,6 +187,15 @@ try:
     count = len([call for call in calls if call['method'] == 'turn/start'])
     assert relay.hook(stop) == {}
     assert len([call for call in calls if call['method'] == 'turn/start']) == count
+    for marker in ('[AI_RELAY_DONE]', '[AI_RELAY_USER]'):
+        relay.hook(event)
+        count = len([call for call in calls if call['method'] == 'turn/start'])
+        proposal = {**stop, 'last_assistant_message': 'Please have Codex review this. ' + marker}
+        assert '현재 커밋 검토 결과' in relay.hook(proposal)['hookSpecificOutput']['additionalContext']
+        assert len([call for call in calls if call['method'] == 'turn/start']) == count + 1
+        assert relay.read_json(relay.state_path(claude))['completed_reviews'] == 1
+        assert relay.hook(proposal) == {}
+        assert len([call for call in calls if call['method'] == 'turn/start']) == count + 1
     mode = 'done'
     relay.hook(event)
     assert '[AI_RELAY_DONE]' in relay.hook(stop)['hookSpecificOutput']['additionalContext']

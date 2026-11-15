@@ -89,13 +89,35 @@ class RoleTests(unittest.TestCase):
         self.config['initiator'] = 'claude'
         relay.write_json(relay.CONFIG, self.config)
         for marker in ('[AI_RELAY_DONE]', '[AI_RELAY_USER]'):
-            relay.write_json(relay.state_path(CLAUDE), {'epoch': 'reviewed', 'round': 1, 'done': False})
+            relay.write_json(relay.state_path(CLAUDE), {'epoch': 'reviewed', 'round': 1,
+                                                     'completed_reviews': 1, 'done': False})
             with self.subTest(marker=marker), patch.object(relay, 'CodexClient') as client:
                 result = relay.hook({'session_id': CLAUDE, 'hook_event_name': 'Stop',
                                      'last_assistant_message': 'Here is the final conclusion. ' + marker})
                 self.assertEqual(result, {})
                 client.assert_not_called()
                 self.assertTrue(relay.read_json(relay.state_path(CLAUDE))['done'])
+
+    def test_initial_completion_markers_and_unsuccessful_requests_still_reach_codex(self):
+        self.config['initiator'] = 'claude'
+        relay.write_json(relay.CONFIG, self.config)
+        for marker in ('[AI_RELAY_DONE]', '[AI_RELAY_USER]'):
+            for attempted in (0, 1):
+                state = {'epoch': 'unreviewed', 'round': attempted, 'done': False,
+                         'prompt': 'Discuss this with Codex.', 'completed_reviews': 0}
+                relay.write_json(relay.state_path(CLAUDE), state)
+                client = MagicMock()
+                client.review.return_value = ('Narrow the proposed sentence.', 'peer-turn')
+                with self.subTest(marker=marker, attempted=attempted), \
+                        patch.object(relay, 'CodexClient', return_value=client):
+                    result = relay.hook({'session_id': CLAUDE, 'hook_event_name': 'Stop',
+                                         'last_assistant_message': 'Codex should review this proposal. ' + marker})
+                client.review.assert_called_once()
+                self.assertIn('Codex should review this proposal.', client.review.call_args.args[1])
+                self.assertIn('Narrow the proposed sentence.', result['hookSpecificOutput']['additionalContext'])
+                latest = relay.read_json(relay.state_path(CLAUDE))
+                self.assertEqual(latest['completed_reviews'], 1)
+                self.assertFalse(latest['done'])
 
     def test_background_notification_keeps_human_instructions_and_queued_task(self):
         self.config['initiator'] = 'claude'
